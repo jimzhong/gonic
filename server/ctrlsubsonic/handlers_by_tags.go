@@ -3,12 +3,10 @@ package ctrlsubsonic
 import (
 	"errors"
 	"fmt"
-	"math/rand"
 	"net/http"
 	"net/url"
 	"strconv"
 	"strings"
-	"time"
 
 	"github.com/jinzhu/gorm"
 
@@ -264,11 +262,11 @@ func (c *Controller) ServeGetArtistInfoTwo(r *http.Request) *spec.Response {
 		return sub
 	}
 
-	artist := &db.Artist{}
+	var artist db.Artist
 	err = c.DB.
 		Preload("GuessedFolder").
 		Where("id=?", id.Value).
-		Find(artist).
+		Find(&artist).
 		Error
 	if errors.Is(err, gorm.ErrRecordNotFound) {
 		return spec.NewError(70, "artist with id `%s` not found", id)
@@ -280,7 +278,7 @@ func (c *Controller) ServeGetArtistInfoTwo(r *http.Request) *spec.Response {
 		sub.ArtistInfoTwo.LargeImageURL = c.genAlbumCoverURL(r, artist.GuessedFolder, 256)
 	}
 
-	info, err := lastfm.ArtistGetInfo(apiKey, artist)
+	info, err := lastfm.ArtistGetInfo(apiKey, artist.Name)
 	if err != nil {
 		return spec.NewError(0, "fetching artist info: %v", err)
 	}
@@ -308,13 +306,13 @@ func (c *Controller) ServeGetArtistInfoTwo(r *http.Request) *spec.Response {
 		if i == count {
 			break
 		}
-		artist = &db.Artist{}
+		var artist db.Artist
 		err = c.DB.
 			Select("artists.*, count(albums.id) album_count").
 			Where("name=?", similarInfo.Name).
 			Joins("LEFT JOIN albums ON artists.id=albums.tag_artist_id").
 			Group("artists.id").
-			Find(artist).
+			Find(&artist).
 			Error
 		if errors.Is(err, gorm.ErrRecordNotFound) && !inclNotPresent {
 			continue
@@ -407,9 +405,7 @@ func (c *Controller) genAlbumCoverURL(r *http.Request, folder *db.Album, size in
 }
 
 func (c *Controller) ServeGetTopSongs(r *http.Request) *spec.Response {
-
 	params := r.Context().Value(CtxParams).(params.Params)
-	sub := spec.NewResponse()
 	count := params.GetOrInt("count", 10)
 	artist, err := params.Get("artist")
 	if err != nil {
@@ -418,18 +414,12 @@ func (c *Controller) ServeGetTopSongs(r *http.Request) *spec.Response {
 
 	apiKey, _ := c.DB.GetSetting("lastfm_api_key")
 	if apiKey == "" {
-		return sub
+		return spec.NewResponse()
 	}
-
 	topTracks, err := lastfm.ArtistGetTopTracks(apiKey, artist)
 	if err != nil {
 		return spec.NewError(0, "fetching artist top tracks: %v", err)
 	}
-
-	sub.TopSongs = &spec.TopSongs{
-		Tracks: []*spec.TrackChild{},
-	}
-
 	if len(topTracks.Tracks) == 0 {
 		return spec.NewError(70, "no top tracks found for artist: %v", artist)
 	}
@@ -440,137 +430,112 @@ func (c *Controller) ServeGetTopSongs(r *http.Request) *spec.Response {
 	}
 
 	var tracks []*db.Track
-	q := c.DB.
-		Preload("Artist").
+	err = c.DB.
 		Preload("Album").
-		Select("tracks.*").
-		Where("tracks.tag_title IN ( ? )", topTrackNames)
-
-	if err := q.Limit(count).Find(&tracks).Error; err != nil {
+		Where("tracks.tag_title IN (?)", topTrackNames).
+		Limit(count).
+		Find(&tracks).
+		Error
+	if err != nil {
 		return spec.NewError(0, "error finding tracks: %v", err)
 	}
 
-	sub.TopSongs.Tracks = make([]*spec.TrackChild, len(tracks))
-
-	if len(sub.TopSongs.Tracks) == 0 {
-		return spec.NewError(70, "no tracks found matchind last fm top songs for artist: %v", artist)
+	sub := spec.NewResponse()
+	sub.TopSongs = &spec.TopSongs{
+		Tracks: make([]*spec.TrackChild, len(tracks)),
 	}
-
 	for i, track := range tracks {
 		sub.TopSongs.Tracks[i] = spec.NewTrackByTags(track, track.Album)
 	}
-
 	return sub
 }
 
 func (c *Controller) ServeGetSimilarSongs(r *http.Request) *spec.Response {
 	params := r.Context().Value(CtxParams).(params.Params)
-	sub := spec.NewResponse()
-	sub.SimilarSongs = &spec.SimilarSongs{
-		Tracks: []*spec.TrackChild{},
-	}
-
 	count := params.GetOrInt("count", 10)
 	id, err := params.GetID("id")
-	if err != nil {
-		return spec.NewError(10, "please provide an `id` parameter")
+	if err != nil || id.Type != specid.Track {
+		return spec.NewError(10, "please provide an track `id` parameter")
 	}
-
 	apiKey, _ := c.DB.GetSetting("lastfm_api_key")
 	if apiKey == "" {
-		return sub
+		return spec.NewResponse()
 	}
 
-	track := &db.Track{}
-	err = c.DB.Debug().
+	var track db.Track
+	err = c.DB.
 		Preload("Artist").
 		Preload("Album").
 		Where("id=?", id.Value).
-		First(track).Error
+		First(&track).
+		Error
 	if errors.Is(err, gorm.ErrRecordNotFound) {
 		return spec.NewError(10, "couldn't find a track with that id")
 	}
 
-	similarTracks, err := lastfm.TrackGetSimilarTracks(apiKey, track)
+	similarTracks, err := lastfm.TrackGetSimilarTracks(apiKey, track.Artist.Name, track.TagTitle)
 	if err != nil {
 		return spec.NewError(0, "fetching track similar tracks: %v", err)
 	}
-
-	sub.SimilarSongs = &spec.SimilarSongs{
-		Tracks: make([]*spec.TrackChild, count),
-	}
-
 	if len(similarTracks.Tracks) == 0 {
 		return spec.NewError(70, "no similar songs found for track: %v", track.TagTitle)
 	}
+
 	similarTrackNames := make([]string, len(similarTracks.Tracks))
 	for i, t := range similarTracks.Tracks {
 		similarTrackNames[i] = t.Name
 	}
 
 	var tracks []*db.Track
-	q := c.DB.
+	err = c.DB.
 		Preload("Artist").
 		Preload("Album").
 		Select("tracks.*").
-		Where("tracks.tag_title IN ( ? )", similarTrackNames)
-
-	if err := q.Limit(1000).Find(&tracks).Error; err != nil {
+		Where("tracks.tag_title IN (?)", similarTrackNames).
+		Order(gorm.Expr("random()")).
+		Limit(count).
+		Find(&tracks).
+		Error
+	if err != nil {
 		return spec.NewError(0, "error finding tracks: %v", err)
 	}
 
-	lastfmTracks := make([]*spec.TrackChild, len(tracks))
-	if len(sub.SimilarSongs.Tracks) == 0 {
-		return spec.NewError(70, "no similar song could be match with collection in database: %v", track.TagTitle)
+	sub := spec.NewResponse()
+	sub.SimilarSongs = &spec.SimilarSongs{
+		Tracks: make([]*spec.TrackChild, len(tracks)),
 	}
-
 	for i, track := range tracks {
-		lastfmTracks[i] = spec.NewTrackByTags(track, track.Album)
+		sub.SimilarSongs.Tracks[i] = spec.NewTrackByTags(track, track.Album)
 	}
-	rand.Seed(time.Now().UnixNano())
-	rand.Shuffle(len(lastfmTracks), func(i, j int) { lastfmTracks[i], lastfmTracks[j] = lastfmTracks[j], lastfmTracks[i] })
-
-	for i := 0; i < count; i++ {
-		sub.SimilarSongs.Tracks[i] = lastfmTracks[i]
-	}
-
-	sub.SimilarSongs.Tracks = lastfmTracks
 	return sub
 }
 
 func (c *Controller) ServeGetSimilarSongsTwo(r *http.Request) *spec.Response {
 	params := r.Context().Value(CtxParams).(params.Params)
-	sub := spec.NewResponse()
-	sub.SimilarSongsTwo = &spec.SimilarSongsTwo{
-		Tracks: []*spec.TrackChild{},
-	}
-
 	count := params.GetOrInt("count", 10)
 	id, err := params.GetID("id")
-	if err != nil {
-		return spec.NewError(10, "please provide an `id` parameter")
+	if err != nil || id.Type != specid.Artist {
+		return spec.NewError(10, "please provide an artist `id` parameter")
 	}
 
 	apiKey, _ := c.DB.GetSetting("lastfm_api_key")
 	if apiKey == "" {
-		return sub
+		return spec.NewResponse()
 	}
 
-	artist := &db.Artist{}
-	err = c.DB.Debug().
+	var artist db.Artist
+	err = c.DB.
 		Where("id=?", id.Value).
-		First(artist).
+		First(&artist).
 		Error
-
 	if errors.Is(err, gorm.ErrRecordNotFound) {
 		return spec.NewError(0, "artist with id `%s` not found", id)
 	}
 
-	similarArtists, err := lastfm.ArtistGetSimilar(apiKey, artist)
+	similarArtists, err := lastfm.ArtistGetSimilar(apiKey, artist.Name)
 	if err != nil {
 		return spec.NewError(0, "fetching artist similar artists: %v", err)
 	}
-
 	if len(similarArtists.Artists) == 0 {
 		return spec.NewError(0, "no similar artist found for: %v", artist.Name)
 	}
@@ -580,35 +545,25 @@ func (c *Controller) ServeGetSimilarSongsTwo(r *http.Request) *spec.Response {
 		artistNames[i] = similarArtist.Name
 	}
 
-	tracks := []*db.Track{}
-	q := c.DB.Debug().
+	var tracks []*db.Track
+	err = c.DB.
 		Preload("Album").
-		Joins("JOIN artists on tracks.artist_id = artists.id").
-		Where("artists.name IN (?)", artistNames)
-
-	if err := q.Limit(1000).Find(&tracks).Error; err != nil {
+		Joins("JOIN artists on tracks.artist_id=artists.id").
+		Where("artists.name IN (?)", artistNames).
+		Order(gorm.Expr("random()")).
+		Limit(count).
+		Find(&tracks).
+		Error
+	if err != nil {
 		return spec.NewError(0, "error finding tracks: %v", err)
 	}
 
-	sub.SimilarSongsTwo.Tracks = make([]*spec.TrackChild, count)
-
-	if len(sub.SimilarSongsTwo.Tracks) == 0 {
-		return spec.NewError(70, "no similar song could be match with collection in database: %v", artist.Name)
+	sub := spec.NewResponse()
+	sub.SimilarSongsTwo = &spec.SimilarSongsTwo{
+		Tracks: make([]*spec.TrackChild, len(tracks)),
 	}
-
-	//shuffle results before trimming, to prevent having songs belonging to 1 artist
-	similarTracks := make([]*spec.TrackChild, len(tracks))
 	for i, track := range tracks {
-		similarTracks[i] = spec.NewTrackByTags(track, track.Album)
-	}
-
-	rand.Seed(time.Now().UnixNano())
-	rand.Shuffle(len(similarTracks), func(i, j int) {
-		similarTracks[i], similarTracks[j] = similarTracks[j], similarTracks[i]
-	})
-
-	for i := 0; i < count; i++ {
-		sub.SimilarSongsTwo.Tracks[i] = similarTracks[i]
+		sub.SimilarSongsTwo.Tracks[i] = spec.NewTrackByTags(track, track.Album)
 	}
 
 	return sub

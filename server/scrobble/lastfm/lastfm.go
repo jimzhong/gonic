@@ -93,7 +93,7 @@ type ArtistBio struct {
 }
 
 type TopTracks struct {
-	XMLName xml.Name `xml:toptracks`
+	XMLName xml.Name `xml:"toptracks"`
 	Artist  string   `xml:"artist,attr"`
 	Tracks  []Track  `xml:"track"`
 }
@@ -161,11 +161,11 @@ func makeRequest(method string, params url.Values) (LastFM, error) {
 	return lastfm, nil
 }
 
-func ArtistGetInfo(apiKey string, artist *db.Artist) (Artist, error) {
+func ArtistGetInfo(apiKey string, artistName string) (Artist, error) {
 	params := url.Values{}
 	params.Add("method", "artist.getInfo")
 	params.Add("api_key", apiKey)
-	params.Add("artist", artist.Name)
+	params.Add("artist", artistName)
 	resp, err := makeRequest("GET", params)
 	if err != nil {
 		return Artist{}, fmt.Errorf("making artist GET: %w", err)
@@ -185,32 +185,28 @@ func ArtistGetTopTracks(apiKey, artistName string) (TopTracks, error) {
 	return resp.TopTracks, nil
 }
 
-func TrackGetSimilarTracks(apiKey string, track *db.Track) (SimilarTracks, error) {
+func TrackGetSimilarTracks(apiKey string, artistName, trackName string) (SimilarTracks, error) {
 	params := url.Values{}
 	params.Add("method", "track.getSimilar")
 	params.Add("api_key", apiKey)
-	params.Add("track", track.TagTitle)
-	params.Add("artist", track.Artist.Name)
-
+	params.Add("track", trackName)
+	params.Add("artist", artistName)
 	resp, err := makeRequest("GET", params)
 	if err != nil {
-		return SimilarTracks{}, fmt.Errorf("making track GET: %s %s %w", track.TagTitle, track.Artist.Name, err)
+		return SimilarTracks{}, fmt.Errorf("making track GET: %w", err)
 	}
-
 	return resp.SimilarTracks, nil
 }
 
-func ArtistGetSimilar(apiKey string, artist *db.Artist) (SimilarArtists, error) {
+func ArtistGetSimilar(apiKey string, artistName string) (SimilarArtists, error) {
 	params := url.Values{}
 	params.Add("method", "artist.getSimilar")
 	params.Add("api_key", apiKey)
-	params.Add("artist", artist.Name)
-
+	params.Add("artist", artistName)
 	resp, err := makeRequest("GET", params)
 	if err != nil {
 		return SimilarArtists{}, fmt.Errorf("making similar artists GET:  %w", err)
 	}
-
 	return resp.SimilarArtists, nil
 }
 
