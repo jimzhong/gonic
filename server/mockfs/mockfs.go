@@ -1,14 +1,17 @@
 package mockfs
 
 import (
+	"context"
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/mattn/go-sqlite3"
 	"go.senan.xyz/gonic/server/db"
 	"go.senan.xyz/gonic/server/scanner"
 	"go.senan.xyz/gonic/server/scanner/tags"
@@ -17,11 +20,11 @@ import (
 var ErrPathNotFound = errors.New("path not found")
 
 type MockFS struct {
-	t       testing.TB
-	scanner *scanner.Scanner
-	dir     string
-	reader  *mreader
-	db      *db.DB
+	t         testing.TB
+	scanner   *scanner.Scanner
+	dir       string
+	tagReader *tagReader
+	db        *db.DB
 }
 
 func New(t testing.TB) *MockFS                        { return new(t, []string{""}) }
@@ -49,25 +52,31 @@ func new(t testing.TB, dirs []string) *MockFS {
 		}
 	}
 
-	parser := &mreader{map[string]*Tags{}}
-	scanner := scanner.New(absDirs, dbc, ";", parser)
+	tagReader := &tagReader{paths: map[string]*tagReaderResult{}}
+	scanner := scanner.New(absDirs, dbc, ";", tagReader)
 
 	return &MockFS{
-		t:       t,
-		scanner: scanner,
-		dir:     tmpDir,
-		reader:  parser,
-		db:      dbc,
+		t:         t,
+		scanner:   scanner,
+		dir:       tmpDir,
+		tagReader: tagReader,
+		db:        dbc,
 	}
 }
 
 func (m *MockFS) DB() *db.DB     { return m.db }
 func (m *MockFS) TmpDir() string { return m.dir }
 
-func (m *MockFS) ScanAndClean() {
-	if err := m.scanner.ScanAndClean(scanner.ScanOptions{}); err != nil {
+func (m *MockFS) ScanAndClean() *scanner.Context {
+	ctx, err := m.scanner.ScanAndClean(scanner.ScanOptions{})
+	if err != nil {
 		m.t.Fatalf("error scan and cleaning: %v", err)
 	}
+	return ctx
+}
+
+func (m *MockFS) ScanAndCleanErr() (*scanner.Context, error) {
+	return m.scanner.ScanAndClean(scanner.ScanOptions{})
 }
 
 func (m *MockFS) ResetDates() {
@@ -99,11 +108,12 @@ func (m *MockFS) addItems(prefix string, covers bool) {
 		for al := 0; al < 3; al++ {
 			for tr := 0; tr < 3; tr++ {
 				m.AddTrack(p("artist-%d/album-%d/track-%d.flac", ar, al, tr))
-				m.SetTags(p("artist-%d/album-%d/track-%d.flac", ar, al, tr), func(tags *Tags) {
+				m.SetTags(p("artist-%d/album-%d/track-%d.flac", ar, al, tr), func(tags *Tags) error {
 					tags.RawArtist = fmt.Sprintf("artist-%d", ar)
 					tags.RawAlbumArtist = fmt.Sprintf("artist-%d", ar)
 					tags.RawAlbum = fmt.Sprintf("album-%d", al)
 					tags.RawTitle = fmt.Sprintf("title-%d", tr)
+					return nil
 				})
 			}
 			if covers {
@@ -111,6 +121,10 @@ func (m *MockFS) addItems(prefix string, covers bool) {
 			}
 		}
 	}
+}
+
+func (m *MockFS) NumTracks() int {
+	return len(m.tagReader.paths)
 }
 
 func (m *MockFS) RemoveAll(path string) {
@@ -129,8 +143,8 @@ func (m *MockFS) Symlink(src, dest string) {
 	}
 	src = filepath.Clean(src)
 	dest = filepath.Clean(dest)
-	for k, v := range m.reader.tags {
-		m.reader.tags[strings.Replace(k, src, dest, 1)] = v
+	for k, v := range m.tagReader.paths {
+		m.tagReader.paths[strings.Replace(k, src, dest, 1)] = v
 	}
 }
 
@@ -235,30 +249,87 @@ func (m *MockFS) AddCover(path string) {
 	defer f.Close()
 }
 
-func (m *MockFS) SetTags(path string, cb func(*Tags)) {
+func (m *MockFS) SetTags(path string, cb func(*Tags) error) {
 	abspath := filepath.Join(m.dir, path)
 	if err := os.Chtimes(abspath, time.Time{}, time.Now()); err != nil {
 		m.t.Fatalf("touch track: %v", err)
 	}
-	if _, ok := m.reader.tags[abspath]; !ok {
-		m.reader.tags[abspath] = &Tags{}
+	r := m.tagReader
+	if _, ok := r.paths[abspath]; !ok {
+		r.paths[abspath] = &tagReaderResult{tags: &Tags{}}
 	}
-	cb(m.reader.tags[abspath])
+	if err := cb(r.paths[abspath].tags); err != nil {
+		r.paths[abspath].err = err
+	}
 }
 
-type mreader struct {
-	tags map[string]*Tags
+func (m *MockFS) DumpDB(suffix ...string) {
+	var p []string
+	p = append(p,
+		"gonic", "dump",
+		strings.ReplaceAll(m.t.Name(), string(filepath.Separator), "-"),
+		fmt.Sprint(time.Now().UnixNano()),
+	)
+	p = append(p, suffix...)
+
+	destPath := filepath.Join(os.TempDir(), strings.Join(p, "-"))
+	dest, err := db.New(destPath, url.Values{})
+	if err != nil {
+		m.t.Fatalf("create dest db: %v", err)
+	}
+	defer dest.Close()
+
+	connSrc, err := m.db.DB.DB().Conn(context.Background())
+	if err != nil {
+		m.t.Fatalf("getting src raw conn: %v", err)
+	}
+	defer connSrc.Close()
+	connDest, err := dest.DB.DB().Conn(context.Background())
+	if err != nil {
+		m.t.Fatalf("getting dest raw conn: %v", err)
+	}
+	defer connDest.Close()
+
+	err = connDest.Raw(func(connDest interface{}) error {
+		return connSrc.Raw(func(connSrc interface{}) error {
+			connDestq := connDest.(*sqlite3.SQLiteConn)
+			connSrcq := connSrc.(*sqlite3.SQLiteConn)
+			bk, err := connDestq.Backup("main", connSrcq, "main")
+			if err != nil {
+				return fmt.Errorf("create backup db: %w", err)
+			}
+			for done, _ := bk.Step(-1); !done; {
+				m.t.Logf("dumping db...")
+			}
+			if err := bk.Finish(); err != nil {
+				return fmt.Errorf("finishing dump: %w", err)
+			}
+			return nil
+		})
+	})
+	if err != nil {
+		m.t.Fatalf("backing up: %v", err)
+	}
 }
 
-func (m *mreader) Read(abspath string) (tags.Parser, error) {
-	parser, ok := m.tags[abspath]
+type tagReaderResult struct {
+	tags *Tags
+	err  error
+}
+
+type tagReader struct {
+	paths map[string]*tagReaderResult
+}
+
+func (m *tagReader) Read(abspath string) (tags.Parser, error) {
+	p, ok := m.paths[abspath]
 	if !ok {
 		return nil, ErrPathNotFound
 	}
-	return parser, nil
+	return p.tags, p.err
 }
 
-var _ tags.Reader = (*mreader)(nil)
+var _ tags.Reader = (*tagReader)(nil)
 
 type Tags struct {
 	RawTitle       string
@@ -281,9 +352,18 @@ func (m *Tags) Length() int           { return 100 }
 func (m *Tags) Bitrate() int          { return 100 }
 func (m *Tags) Year() int             { return 2021 }
 
-func (m *Tags) SomeAlbum() string       { return m.Album() }
-func (m *Tags) SomeArtist() string      { return m.Artist() }
-func (m *Tags) SomeAlbumArtist() string { return m.AlbumArtist() }
-func (m *Tags) SomeGenre() string       { return m.Genre() }
+func (m *Tags) SomeAlbum() string       { return first("Unknown Album", m.Album()) }
+func (m *Tags) SomeArtist() string      { return first("Unknown Artist", m.Artist()) }
+func (m *Tags) SomeAlbumArtist() string { return first("Unknown Artist", m.AlbumArtist(), m.Artist()) }
+func (m *Tags) SomeGenre() string       { return first("Unknown Genre", m.Genre()) }
 
 var _ tags.Parser = (*Tags)(nil)
+
+func first(or string, strs ...string) string {
+	for _, str := range strs {
+		if str != "" {
+			return str
+		}
+	}
+	return or
+}
