@@ -57,6 +57,11 @@ func Profiles() map[string]Profile {
 			options:    []string{"-c:a", "libmp3lame"},
 			replayGain: rgForce,
 		},
+		"vorbis": {
+			Format:     "vorbis",
+			Bitrate:    256,
+			options:    []string{"-c:a", "libvorbis", "-qscale:a", "7"},
+		},
 		"opus": {
 			Format:  "opus",
 			Bitrate: 96,
