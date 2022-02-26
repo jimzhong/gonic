@@ -58,7 +58,7 @@ func Profiles() map[string]Profile {
 			replayGain: rgForce,
 		},
 		"vorbis": {
-			Format:     "vorbis",
+			Format:     "ogg",
 			Bitrate:    256,
 			options:    []string{"-c:a", "libvorbis", "-qscale:a", "7"},
 		},
