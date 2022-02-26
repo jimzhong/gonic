@@ -60,7 +60,7 @@ func Profiles() map[string]Profile {
 		"vorbis": {
 			Format:     "ogg",
 			Bitrate:    256,
-			options:    []string{"-c:a", "libvorbis", "-qscale:a", "7"},
+			options:    []string{"-c:a", "libvorbis"},
 		},
 		"opus": {
 			Format:  "opus",
